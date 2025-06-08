@@ -34,6 +34,15 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     double mult_{0.0}, revSize_{0.0};
     int maxlevel_{0};
 
+    // --- anchor/density fields ---
+    int   anchor_layer_ = -1;                      // which level to treat as "anchor"
+    std::vector<tableint>               anchor_labels_;            // for each new node, which anchor node it pierced
+    std::vector<std::vector<tableint>>  anchor_connected_nodes_;   // for each anchor node, list of new nodes
+    std::vector<double>                 local_density_;            // LD = k / (farthest‐KNN‐dist)
+    std::vector<size_t>                 anchor_last_update_count_; // when we last recomputed density
+    size_t                              density_k_     = 20;       // k in LD
+    double                              density_thresh = 0.20;     // 20% growth threshold
+
     std::unique_ptr<VisitedListPool> visited_list_pool_{nullptr};
 
     // Locks operations with element by label value
@@ -138,6 +147,13 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         linkLists_ = (char **) malloc(sizeof(void *) * max_elements_);
         if (linkLists_ == nullptr)
             throw std::runtime_error("Not enough memory: HierarchicalNSW failed to allocate linklists");
+       
+        // after linkLists_ = malloc(...)...
+        anchor_labels_.assign      (max_elements_, (tableint)-1);
+        anchor_connected_nodes_.resize(max_elements_);
+        local_density_.assign      (max_elements_, 0.0);
+        anchor_last_update_count_.assign(max_elements_, 0);
+
         size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
         mult_ = 1 / log(1.0 * M_);
         revSize_ = 1.0 / mult_;
@@ -169,6 +185,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
     };
 
+    
 
     void setEf(size_t ef) {
         ef_ = ef;
@@ -1139,8 +1156,8 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     }
 
 
-    std::vector<tableint> getConnectionsWithLock(tableint internalId, int level) {
-        std::unique_lock <std::mutex> lock(link_list_locks_[internalId]);
+    std::vector<tableint> getConnectionsWithLock(tableint internalId, int level) const  {
+        // std::unique_lock <std::mutex> lock(link_list_locks_[internalId]);
         unsigned int *data = get_linklist_at_level(internalId, level);
         int size = getListCount(data);
         std::vector<tableint> result(size);
@@ -1242,7 +1259,25 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             for (int level = std::min(curlevel, maxlevelcopy); level >= 0; level--) {
                 if (level > maxlevelcopy || level < 0)  // possible?
                     throw std::runtime_error("Level error");
+                // --- anchor‐layer hook: record and maybe update density ---
+                if (level == anchor_layer_) {
+                    // remember which node we pierced
+                    anchor_labels_[cur_c] = currObj;
+                    // attach this new node under that anchor
+                    auto &vec = anchor_connected_nodes_[currObj];
+                    vec.push_back(cur_c);
+                    size_t newCount = vec.size();
 
+                    // if grown ≥20% since last update, recompute density
+                    if (newCount >= anchor_last_update_count_[currObj] * (1.0 + density_thresh)) {
+                        // find the farthest of k‐NN around the anchor
+                        auto pq = this->searchKnn(getDataByInternalId(currObj), density_k_);
+                        double farthest = pq.top().first;
+                        local_density_[currObj] = double(density_k_) / farthest;
+                        anchor_last_update_count_[currObj] = newCount;
+                    }
+                }
+                    
                 std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates = searchBaseLayer(
                         currObj, data_point, level);
                 if (epDeleted) {
@@ -1256,6 +1291,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             // Do nothing for the first element
             enterpoint_node_ = 0;
             maxlevel_ = curlevel;
+            anchor_layer_ = curlevel /2;
         }
 
         // Releasing lock for the maximum level
@@ -1408,5 +1444,156 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         }
         std::cout << "integrity ok, checked " << connections_checked << " connections\n";
     }
+
+
+    std::vector<labeltype> reverseSearchKnn(const void* query_data, size_t k, float recall = 1.0f) {
+        // 1. Determine hop count k' via Algorithm 1
+        size_t kprime = getHopCountForQuery(k, recall);
+
+        // 2. Insert query temporarily at level 0 to get its 1-hop neighbors
+        std::vector<tableint> curHop;
+        std::vector<tableint> candidateSet;
+        tableint qid;
+        {
+            labeltype qlabel = std::numeric_limits<labeltype>::max();
+            qid = this->addPoint(query_data, qlabel,-1);
+            curHop = getConnectionsWithLock(qid, 0);
+            candidateSet = curHop;
+            markDelete(qlabel);
+        }
+
+        // 2.5 Compute query region density: k-NN around query
+        auto qknn = this->searchKnn(query_data, density_k_);
+        double far_q = qknn.top().first;
+        double query_density = double(density_k_) / far_q;
+
+        // 3. Estimate threshold ED_k'
+        double ED = estimateED(query_data, kprime, curHop);
+
+        // 4. BFS outward up to k' hops with PS1 and density pruning
+        for (size_t h = 2; h <= kprime; ++h) {
+            std::vector<tableint> nextHop;
+            for (auto pid : curHop) {
+                auto neigh = getConnectionsWithLock(pid, 0);
+                for (auto vid : neigh) {
+                    if (!prunePS1(query_data, vid, ED)) continue;
+                    if (!pruneDensity(query_density, vid)) continue;
+                    candidateSet.push_back(vid);
+                    nextHop.push_back(vid);
+                }
+            }
+            curHop.swap(nextHop);
+            if (curHop.empty()) break;
+        }
+
+        // 5. Pruning strategy PS2 (plus density pruning)
+        std::vector<tableint> verifiedCandidates;
+        for (auto oid : candidateSet) {
+            if (!prunePS2(query_data, oid, kprime, k)) continue;
+            if (!pruneDensity(query_density, oid)) continue;
+            verifiedCandidates.push_back(oid);
+        }
+
+        // 6. Verification: keep those where query appears in their k-NN
+        std::unordered_set<labeltype> results;
+        for (auto oid : verifiedCandidates) {
+            char* data_o = getDataByInternalId(oid);
+            auto knn = this->searchKnn(data_o, k);
+            while (!knn.empty()) {
+                auto p = knn.top();
+                knn.pop();
+                if (getExternalLabel(oid) != std::numeric_limits<labeltype>::max()) {
+                    results.insert(getExternalLabel(oid));
+                    break;
+                }
+            }            
+        }
+        std::vector<labeltype> final_results(results.begin(), results.end());
+
+        return final_results;
+    }
+
+    /**
+     * Set pr(h) distribution for hop-count calculation (Algorithm 1).
+     * pr_dist_[h] = pr(p, h) as per the paper.
+     */
+    void setPrDistribution(const std::vector<double>& pr) {
+        pr_dist_ = pr;
+    }
+
+    /**
+     * Set the density ratio threshold: candidate density must be >=
+     * (query_density * ratio) to be kept.
+     */
+    void setDensityRatioThreshold(double ratio) {
+        density_ratio_threshold_ = ratio;
+    }
+
+private:
+    // pr(p, h) distribution for h = 1..H
+    std::vector<double> pr_dist_;
+
+    // density-based pruning parameters
+    // size_t density_k_ = 20;
+    double density_ratio_threshold_ = 0.5;  // keep candidates whose region density >= 0.5 * query_density
+
+    /** Algorithm 1: choose hop count k' */
+    size_t getHopCountForQuery(size_t k, float recall) const {
+        size_t H = std::min(k, (size_t)std::ceil(std::log((double)max_elements_) / std::log((double)M_)));
+        size_t kprime = 0;
+        double acc = 0.0;
+        while (acc < recall && kprime < H) {
+            ++kprime;
+            if (kprime >= pr_dist_.size()) break;
+            acc += pr_dist_[kprime];
+        }
+        return std::min(kprime, H);
+    }
+
+    /** Parzen estimator ED(k') = ED1 * (ω * k')^(1/d) */
+    double estimateED(const void* query_data, size_t kprime,
+                      const std::vector<tableint>& oneHop) const {
+        double ED1 = 0.0;
+        for (auto pid : oneHop) {
+            double d = fstdistfunc_(query_data, getDataByInternalId(pid), dist_func_param_);
+            ED1 = std::max(ED1, d);
+        }
+        double sum_deg = 0.0;
+        for (size_t i = 0; i < cur_element_count; ++i)
+            sum_deg += getConnectionsWithLock(i, 0).size();
+        double omega = sum_deg / (double)cur_element_count;
+        size_t dim = *((size_t*)dist_func_param_);
+        double factor = std::pow(omega * kprime, 1.0 / dim);
+        return ED1 * factor;
+    }
+
+    /** PS1: prune if distance > ED threshold */
+    bool prunePS1(const void* query_data, tableint node_id, double ED) const {
+        double d = fstdistfunc_(query_data, getDataByInternalId(node_id), dist_func_param_);
+        return d <= ED;
+    }
+
+    /** PS2: prune if d(q,o) > l-th neighbor distance of o */
+    bool prunePS2(const void* query_data, tableint node_id,
+                  size_t kprime, size_t /*k*/) const {
+        double d_o_q = fstdistfunc_(query_data, getDataByInternalId(node_id), dist_func_param_);
+        auto neigh = getConnectionsWithLock(node_id, 0);
+        if (neigh.empty()) return false;
+        std::vector<double> ds;
+        ds.reserve(neigh.size());
+        for (auto nid : neigh)
+            ds.push_back(fstdistfunc_(getDataByInternalId(nid), getDataByInternalId(node_id), dist_func_param_));
+        size_t l = std::min(kprime, neigh.size());
+        std::nth_element(ds.begin(), ds.begin() + l - 1, ds.end());
+        return d_o_q <= ds[l - 1];
+    }
+
+    /** Density-based prune: keep if region density >= ratio * query density */
+    bool pruneDensity(double query_density, tableint node_id) const {
+        int a = anchor_labels_[node_id];
+        if (a < 0) return true;  // no anchor info, do not prune
+        double dens = local_density_[a];
+        return dens >= query_density * density_ratio_threshold_;
+    }    
 };
 }  // namespace hnswlib
