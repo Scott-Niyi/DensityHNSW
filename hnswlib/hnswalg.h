@@ -9,6 +9,8 @@
 #include <unordered_set>
 #include <list>
 #include <memory>
+#include <set>
+#include <chrono>
 
 namespace hnswlib {
 typedef unsigned int tableint;
@@ -35,13 +37,24 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     int maxlevel_{0};
 
     // --- anchor/density fields ---
-    int   anchor_layer_ = -1;                      // which level to treat as "anchor"
+    int   anchor_layer_ = 1;                      // which level to treat as "anchor"
     std::vector<tableint>               anchor_labels_;            // for each new node, which anchor node it pierced
     std::vector<std::vector<tableint>>  anchor_connected_nodes_;   // for each anchor node, list of new nodes
+    std::unordered_set<tableint>        anchor_list_;              // a record list of all anchors 
     std::vector<double>                 local_density_;            // LD = k / (farthest‐KNN‐dist)
     std::vector<size_t>                 anchor_last_update_count_; // when we last recomputed density
-    size_t                              density_k_     = 20;       // k in LD
+    size_t                              density_k_     = 10;       // k in LD
     double                              density_thresh = 0.20;     // 20% growth threshold
+
+    // for each anchor a, the set of (distance,node)
+    // sorted ascending by distance
+    std::vector<std::set<std::pair<dist_t, tableint> > > anchor_children_by_dist_;
+
+    // for each node u, an iterator into whichever anchor_children_by_dist_ it lives in,
+    std::vector<typename std::set<std::pair<dist_t,tableint>>::iterator> anchor_child_it_;
+
+    // for each node u, its current distance to anchor_labels_[u]
+    std::vector<dist_t> node_anchor_dist_;
 
     std::unique_ptr<VisitedListPool> visited_list_pool_{nullptr};
 
@@ -79,7 +92,12 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
     std::mutex deleted_elements_lock;  // lock for deleted_elements
     std::unordered_set<tableint> deleted_elements;  // contains internal ids of deleted elements
 
+    /* ------------------------------------------------------------------ */
+    /*  Bridge & Burst join support                                       */
+    /* ------------------------------------------------------------------ */
+    std::vector<std::vector<tableint>>  bridge_out_;        //  a-anchor → list of b-anchors
 
+    
     HierarchicalNSW(SpaceInterface<dist_t> *s) {
     }
 
@@ -153,6 +171,13 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         anchor_connected_nodes_.resize(max_elements_);
         local_density_.assign      (max_elements_, 0.0);
         anchor_last_update_count_.assign(max_elements_, 0);
+        anchor_children_by_dist_.resize(max_elements_);
+        anchor_child_it_.resize      (max_elements_);
+        node_anchor_dist_.assign     (max_elements_, std::numeric_limits<dist_t>::infinity());
+        anchor_last_update_count_.assign(max_elements_, 0);
+
+        /* Bridge table (initially empty) */
+        bridge_out_.resize(max_elements_);
 
         size_links_per_element_ = maxM_ * sizeof(tableint) + sizeof(linklistsizeint);
         mult_ = 1 / log(1.0 * M_);
@@ -726,6 +751,66 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             if (linkListSize)
                 output.write(linkLists_[i], linkListSize);
         }
+
+        // 1) anchor_layer_
+        writeBinaryPOD(output, anchor_layer_);
+        
+        // 2) anchor_labels_
+        writeBinaryPOD(output, anchor_labels_.size());
+        for (auto &lbl : anchor_labels_) writeBinaryPOD(output, lbl);
+        
+        // 3) anchor_connected_nodes_
+        writeBinaryPOD(output, anchor_connected_nodes_.size());
+        for (auto &vec : anchor_connected_nodes_) {
+            writeBinaryPOD(output, vec.size());
+            for (auto &n : vec) writeBinaryPOD(output, n);
+        }
+        
+        // 4) anchor_list_
+        writeBinaryPOD(output, anchor_list_.size());
+        for (auto &a : anchor_list_) writeBinaryPOD(output, a);
+        
+        // 5) local_density_
+        writeBinaryPOD(output, local_density_.size());
+        for (auto &d : local_density_) writeBinaryPOD(output, d);
+        
+        // 6) anchor_last_update_count_
+        writeBinaryPOD(output, anchor_last_update_count_.size());
+        for (auto &c : anchor_last_update_count_) writeBinaryPOD(output, c);
+        
+        // 7) density_k_ & density_thresh
+        writeBinaryPOD(output, density_k_);
+        writeBinaryPOD(output, density_thresh);
+        
+        // 8) anchor_children_by_dist_
+        writeBinaryPOD(output, anchor_children_by_dist_.size());
+        for (auto &childSet : anchor_children_by_dist_) {
+            writeBinaryPOD(output, childSet.size());
+            for (auto &pr : childSet) {
+                writeBinaryPOD(output, pr.first);   // distance
+                writeBinaryPOD(output, pr.second);  // node id
+            }
+        }
+        
+        // 9) node_anchor_dist_
+        writeBinaryPOD(output, node_anchor_dist_.size());
+        for (auto &d : node_anchor_dist_) writeBinaryPOD(output, d);
+        
+        // 10) bridge_out_
+        writeBinaryPOD(output, bridge_out_.size());
+        for (auto &vec : bridge_out_) {
+            writeBinaryPOD(output, vec.size());
+            for (auto &n : vec) writeBinaryPOD(output, n);
+        }
+        
+        // 11) pr_dist_
+        writeBinaryPOD(output, pr_dist_.size());
+        for (auto &p : pr_dist_) writeBinaryPOD(output, p);
+        
+        // 12) density_ratio_threshold_
+        writeBinaryPOD(output, density_ratio_threshold_);
+        // … end of new fields …
+                
         output.close();
     }
 
@@ -768,26 +853,26 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         auto pos = input.tellg();
 
-        /// Optional - check if index is ok:
-        input.seekg(cur_element_count * size_data_per_element_, input.cur);
-        for (size_t i = 0; i < cur_element_count; i++) {
-            if (input.tellg() < 0 || input.tellg() >= total_filesize) {
-                throw std::runtime_error("Index seems to be corrupted or unsupported");
-            }
+        // /// Optional - check if index is ok:
+        // input.seekg(cur_element_count * size_data_per_element_, input.cur);
+        // for (size_t i = 0; i < cur_element_count; i++) {
+        //     if (input.tellg() < 0 || input.tellg() >= total_filesize) {
+        //         throw std::runtime_error("Index seems to be corrupted or unsupported");
+        //     }
 
-            unsigned int linkListSize;
-            readBinaryPOD(input, linkListSize);
-            if (linkListSize != 0) {
-                input.seekg(linkListSize, input.cur);
-            }
-        }
+        //     unsigned int linkListSize;
+        //     readBinaryPOD(input, linkListSize);
+        //     if (linkListSize != 0) {
+        //         input.seekg(linkListSize, input.cur);
+        //     }
+        // }
 
-        // throw exception if it either corrupted or old index
-        if (input.tellg() != total_filesize)
-            throw std::runtime_error("Index seems to be corrupted or unsupported");
+        // // throw exception if it either corrupted or old index
+        // if (input.tellg() != total_filesize)
+        //     throw std::runtime_error("Index seems to be corrupted or unsupported");
 
-        input.clear();
-        /// Optional check end
+        // input.clear();
+        // /// Optional check end
 
         input.seekg(pos, input.beg);
 
@@ -832,6 +917,115 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 if (allow_replace_deleted_) deleted_elements.insert(i);
             }
         }
+
+
+        // 1) anchor_layer_
+        readBinaryPOD(input, anchor_layer_);
+        
+        // 2) anchor_labels_
+        {
+            size_t n; readBinaryPOD(input, n);
+            anchor_labels_.resize(n);
+            for (size_t i = 0; i < n; ++i) readBinaryPOD(input, anchor_labels_[i]);
+        }
+        
+        // 3) anchor_connected_nodes_
+        {
+            size_t na; readBinaryPOD(input, na);
+            anchor_connected_nodes_.resize(na);
+            for (size_t i = 0; i < na; ++i) {
+                size_t ni; readBinaryPOD(input, ni);
+                anchor_connected_nodes_[i].resize(ni);
+                for (size_t j = 0; j < ni; ++j)
+                    readBinaryPOD(input, anchor_connected_nodes_[i][j]);
+            }
+        }
+        
+        // 4) anchor_list_
+        {
+            size_t ns; readBinaryPOD(input, ns);
+            anchor_list_.clear();
+            for (size_t i = 0; i < ns; ++i) {
+                tableint v; readBinaryPOD(input, v);
+                anchor_list_.insert(v);
+            }
+        }
+        
+        // 5) local_density_
+        {
+            size_t nl; readBinaryPOD(input, nl);
+            local_density_.resize(nl);
+            for (size_t i = 0; i < nl; ++i) readBinaryPOD(input, local_density_[i]);
+        }
+        
+        // 6) anchor_last_update_count_
+        {
+            size_t nc; readBinaryPOD(input, nc);
+            anchor_last_update_count_.resize(nc);
+            for (size_t i = 0; i < nc; ++i)
+                readBinaryPOD(input, anchor_last_update_count_[i]);
+        }
+        
+        // 7) density_k_, density_thresh
+        readBinaryPOD(input, density_k_);
+        readBinaryPOD(input, density_thresh);
+        
+        // 8) anchor_children_by_dist_
+        {
+            size_t na; readBinaryPOD(input, na);
+            anchor_children_by_dist_.clear();
+            anchor_children_by_dist_.resize(na);
+            for (size_t i = 0; i < na; ++i) {
+                size_t sz; readBinaryPOD(input, sz);
+                for (size_t j = 0; j < sz; ++j) {
+                    dist_t d; tableint u;
+                    readBinaryPOD(input, d);
+                    readBinaryPOD(input, u);
+                    anchor_children_by_dist_[i].insert({d,u});
+                }
+            }
+        }
+        
+        // 9) node_anchor_dist_
+        {
+            size_t nn; readBinaryPOD(input, nn);
+            node_anchor_dist_.resize(nn);
+            for (size_t i = 0; i < nn; ++i)
+                readBinaryPOD(input, node_anchor_dist_[i]);
+        }
+        
+        // rebuild anchor_child_it_
+        anchor_child_it_.clear();
+        anchor_child_it_.resize(cur_element_count);
+        for (size_t a = 0; a < anchor_children_by_dist_.size(); ++a) {
+            for (auto it = anchor_children_by_dist_[a].begin();
+                it != anchor_children_by_dist_[a].end(); ++it)
+            {
+                anchor_child_it_[ it->second ] = it;
+            }
+        }
+        
+        // 10) bridge_out_
+        {
+            size_t nb; readBinaryPOD(input, nb);
+            bridge_out_.resize(nb);
+            for (size_t i = 0; i < nb; ++i) {
+                size_t ni; readBinaryPOD(input, ni);
+                bridge_out_[i].resize(ni);
+                for (size_t j = 0; j < ni; ++j)
+                    readBinaryPOD(input, bridge_out_[i][j]);
+            }
+        }
+        
+        // 11) pr_dist_
+        {
+            size_t np; readBinaryPOD(input, np);
+            pr_dist_.resize(np);
+            for (size_t i = 0; i < np; ++i) readBinaryPOD(input, pr_dist_[i]);
+        }
+        
+        // 12) density_ratio_threshold_
+        readBinaryPOD(input, density_ratio_threshold_);
 
         input.close();
 
@@ -1202,6 +1396,11 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         std::unique_lock <std::mutex> lock_el(link_list_locks_[cur_c]);
         int curlevel = getRandomLevel(mult_);
+        if (cur_c == 0)
+        {
+            curlevel = 1;
+        }
+        
         if (level > 0)
             curlevel = level;
 
@@ -1252,6 +1451,54 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                             }
                         }
                     }
+                    if (curlevel >= anchor_layer_ and level == anchor_layer_)
+                    {
+                        anchor_labels_[cur_c] = cur_c;
+                        auto &vec = anchor_connected_nodes_[cur_c];
+                        vec.push_back(cur_c);
+
+                        // 1) compute and record its dist to its anchor
+                        dist_t d = 0;
+                        node_anchor_dist_[cur_c] = d;
+
+                        // 2) insert into that anchor's sorted set
+                        auto &S = anchor_children_by_dist_[cur_c];
+                        // auto [it, ok] = S.emplace(d, cur_c);
+                        auto insert_res = S.emplace(d, cur_c);
+                        auto it         = insert_res.first;
+                        // bool ok         = insert_res.second; 
+                        anchor_child_it_[cur_c] = it;
+
+                        anchor_list_.insert(cur_c);
+
+
+                        continue;
+                        
+                    }
+                    
+                    if (level == anchor_layer_) {
+                        // remember which node we pierced
+                        anchor_labels_[cur_c] = currObj;
+                        // attach this new node under that anchor
+                        auto &vec = anchor_connected_nodes_[currObj];
+                        vec.push_back(cur_c);
+
+                        // 1) compute and record its dist to its anchor
+                        dist_t d = fstdistfunc_(getDataByInternalId(cur_c),
+                                                getDataByInternalId(currObj),
+                                                dist_func_param_);
+                        node_anchor_dist_[cur_c] = d;
+
+                        // 2) insert into that anchor's sorted set
+                        auto &S = anchor_children_by_dist_[currObj];
+                        // auto [it, ok] = S.emplace(d, cur_c);
+                        auto insert_res = S.emplace(d, cur_c);
+                        auto it         = insert_res.first;
+                        bool ok         = insert_res.second;                         
+                        anchor_child_it_[cur_c] = it;
+
+
+                    }                
                 }
             }
 
@@ -1260,22 +1507,46 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 if (level > maxlevelcopy || level < 0)  // possible?
                     throw std::runtime_error("Level error");
                 // --- anchor‐layer hook: record and maybe update density ---
-                if (level == anchor_layer_) {
+                if (curlevel >= anchor_layer_ and level == anchor_layer_)
+                {
+                    anchor_labels_[cur_c] = cur_c;
+                    auto &vec = anchor_connected_nodes_[cur_c];
+                    vec.push_back(cur_c);
+                    
+                    // 1) compute and record its dist to its anchor
+                    dist_t d = 0;
+                    node_anchor_dist_[cur_c] = d;
+                    
+                    // 2) insert into that anchor's sorted set
+                    auto &S = anchor_children_by_dist_[cur_c];
+                    // auto [it, ok] = S.emplace(d, cur_c);
+                    auto insert_res = S.emplace(d, cur_c);
+                    auto it         = insert_res.first;
+                    bool ok         = insert_res.second;                     
+                    anchor_child_it_[cur_c] = it;
+                    
+                    anchor_list_.insert(cur_c);
+                    
+                }                
+                if (curlevel < anchor_layer_ and level == anchor_layer_) {
                     // remember which node we pierced
                     anchor_labels_[cur_c] = currObj;
-                    // attach this new node under that anchor
                     auto &vec = anchor_connected_nodes_[currObj];
                     vec.push_back(cur_c);
-                    size_t newCount = vec.size();
+                    
+                    // 1) compute and record its dist to its anchor
+                    dist_t d = fstdistfunc_(getDataByInternalId(cur_c),
+                                            getDataByInternalId(currObj),
+                                            dist_func_param_);
+                    node_anchor_dist_[cur_c] = d;
 
-                    // if grown ≥20% since last update, recompute density
-                    if (newCount >= anchor_last_update_count_[currObj] * (1.0 + density_thresh)) {
-                        // find the farthest of k‐NN around the anchor
-                        auto pq = this->searchKnn(getDataByInternalId(currObj), density_k_);
-                        double farthest = pq.top().first;
-                        local_density_[currObj] = double(density_k_) / farthest;
-                        anchor_last_update_count_[currObj] = newCount;
-                    }
+                    // 2) insert into that anchor's sorted set
+                    auto &S = anchor_children_by_dist_[currObj];
+                    auto insert_res = S.emplace(d, cur_c);
+                    auto it         = insert_res.first;
+                    bool ok         = insert_res.second; 
+                    anchor_child_it_[cur_c] = it;
+
                 }
                     
                 std::priority_queue<std::pair<dist_t, tableint>, std::vector<std::pair<dist_t, tableint>>, CompareByFirst> top_candidates = searchBaseLayer(
@@ -1285,13 +1556,64 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                     if (top_candidates.size() > ef_construction_)
                         top_candidates.pop();
                 }
+                auto temp_can = top_candidates;
                 currObj = mutuallyConnectNewElement(data_point, cur_c, top_candidates, level, false);
+                if (level == 0)
+                {                    
+                    auto & anchor_label = anchor_labels_[cur_c];
+                    auto anchor_connected_nodes = anchor_connected_nodes_[anchor_label];
+                    size_t newCount = anchor_connected_nodes.size();
+                    if (newCount >= anchor_last_update_count_[anchor_label] * (1.0 + density_thresh)) {
+                        auto anchor_data = getDataByInternalId(anchor_label);
+                        while (temp_can.size()>10) temp_can.pop();
+                        double farthest =temp_can.top().first;
+                        // std::cout<<"update once ";
+                        local_density_[anchor_label] = double(density_k_) / farthest;
+                        anchor_last_update_count_[anchor_label] = newCount;
+                    }     
+
+                    while (temp_can.size()>0)
+                    {
+                        // Let u = selectedNeighbors[idx], v = cur_c
+                        tableint u = temp_can.top().second;
+                        temp_can.pop();
+                        tableint v = cur_c;                        
+                        // Try to re-anchor u under v’s anchor if closer:
+                        tryReanchor(u, v);
+                        tryReanchor(v, u);
+                    }
+                }                    
+                    
+
+                
             }
         } else {
             // Do nothing for the first element
             enterpoint_node_ = 0;
+            // curlevel = 1;
             maxlevel_ = curlevel;
-            anchor_layer_ = curlevel /2;
+            anchor_layer_ = 1;
+            if (curlevel == anchor_layer_) {
+                // remember which node we pierced
+                anchor_labels_[cur_c] = cur_c;
+                // attach this new node under that anchor
+                auto &vec = anchor_connected_nodes_[cur_c];
+                vec.push_back(cur_c);
+
+                // 1) compute and record its dist to its anchor
+                dist_t d = 0;
+                node_anchor_dist_[cur_c] = d;
+
+                // 2) insert into that anchor's sorted set
+                auto &S = anchor_children_by_dist_[0];
+                auto insert_res = S.emplace(d, cur_c);
+                auto it         = insert_res.first;
+                bool ok         = insert_res.second; 
+                anchor_child_it_[cur_c] = it;      
+
+                anchor_list_.insert(cur_c);
+
+            }            
         }
 
         // Releasing lock for the maximum level
@@ -1447,19 +1769,26 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
 
     std::vector<labeltype> reverseSearchKnn(const void* query_data, size_t k, float recall = 1.0f) {
+        auto t0 =std::chrono::high_resolution_clock::now();
         // 1. Determine hop count k' via Algorithm 1
         size_t kprime = getHopCountForQuery(k, recall);
 
         // 2. Insert query temporarily at level 0 to get its 1-hop neighbors
         std::vector<tableint> curHop;
         std::vector<tableint> candidateSet;
+
+        auto t1 =std::chrono::high_resolution_clock::now();
+
+        auto t_approx = std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+        std::cout<<"Initial takes "<<t_approx<<std::endl;          
         tableint qid;
         {
-            labeltype qlabel = std::numeric_limits<labeltype>::max();
-            qid = this->addPoint(query_data, qlabel,-1);
+            // labeltype qlabel = std::numeric_limits<labeltype>::max();
+            qid = this->searchKnn(query_data, kprime).top().second;
             curHop = getConnectionsWithLock(qid, 0);
             candidateSet = curHop;
-            markDelete(qlabel);
+            // markDelete(qlabel);
         }
 
         // 2.5 Compute query region density: k-NN around query
@@ -1469,6 +1798,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         // 3. Estimate threshold ED_k'
         double ED = estimateED(query_data, kprime, curHop);
+      
+
+
+        t0 =std::chrono::high_resolution_clock::now();
 
         // 4. BFS outward up to k' hops with PS1 and density pruning
         for (size_t h = 2; h <= kprime; ++h) {
@@ -1476,8 +1809,10 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             for (auto pid : curHop) {
                 auto neigh = getConnectionsWithLock(pid, 0);
                 for (auto vid : neigh) {
-                    if (!prunePS1(query_data, vid, ED)) continue;
-                    if (!pruneDensity(query_density, vid)) continue;
+                    // if (!prunePS1(query_data, vid, ED)) {
+                    //     continue;}
+                    // if (!pruneDensity(query_density, vid)) {
+                    //     continue;}
                     candidateSet.push_back(vid);
                     nextHop.push_back(vid);
                 }
@@ -1485,31 +1820,54 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             curHop.swap(nextHop);
             if (curHop.empty()) break;
         }
+        t1 =std::chrono::high_resolution_clock::now();
+        t_approx = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-        // 5. Pruning strategy PS2 (plus density pruning)
-        std::vector<tableint> verifiedCandidates;
-        for (auto oid : candidateSet) {
-            if (!prunePS2(query_data, oid, kprime, k)) continue;
-            if (!pruneDensity(query_density, oid)) continue;
-            verifiedCandidates.push_back(oid);
+        // std::cout<<"There used to be"<<candidateSet.size()<<"candidates\n";
+        std::set<tableint> uni;
+        for (auto i: candidateSet  )
+        {
+            uni.insert(i);
         }
-
+        std::cout<<"There "<<uni.size()<<"unique candidates\n";
+        
+        
+        
+        // 5. Pruning strategy PS2 (plus density pruning)
+        std::unordered_set<tableint> verifiedCandidates;
+        for (auto oid : uni) {
+            // if (!prunePS2(query_data, oid, kprime, k)) continue;
+            if (!prunePS1(query_data, oid, ED)) {
+                continue;}
+            if (!pruneDensity(query_density, oid)) {
+                continue;}            
+            if (!pruneRadius(query_density,oid,query_data)){ continue; }
+            verifiedCandidates.insert(oid);
+        }
+        
+        std::cout<<"Prun2 takes "<<t_approx<<std::endl;
+        std::cout<<"There "<<verifiedCandidates.size()<<" candidates left\n";
         // 6. Verification: keep those where query appears in their k-NN
+        t0 =std::chrono::high_resolution_clock::now();
+
         std::unordered_set<labeltype> results;
         for (auto oid : verifiedCandidates) {
             char* data_o = getDataByInternalId(oid);
-            auto knn = this->searchKnn(data_o, k);
-            while (!knn.empty()) {
-                auto p = knn.top();
-                knn.pop();
-                if (getExternalLabel(oid) != std::numeric_limits<labeltype>::max()) {
-                    results.insert(getExternalLabel(oid));
-                    break;
-                }
-            }            
+            // results.insert(getExternalLabel(oid));
+            double ret_dis = fstdistfunc_(query_data, getDataByInternalId(oid), dist_func_param_);
+
+            auto knn = this->searchKnn(data_o, k+3);
+            auto p = knn.top();
+            double bench_dis = p.first;
+            if (getExternalLabel(oid) != std::numeric_limits<labeltype>::max() and ret_dis <= bench_dis) {
+                results.insert(getExternalLabel(oid));
+            }
         }
         std::vector<labeltype> final_results(results.begin(), results.end());
+        t1 =std::chrono::high_resolution_clock::now();
+        t_approx = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
+        std::cout<<"Verif takes "<<t_approx<<std::endl;
         return final_results;
     }
 
@@ -1529,13 +1887,250 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
         density_ratio_threshold_ = ratio;
     }
 
+    /* ------------------------------------------------------------------ */
+    /*                    AUX-ILIARY HELPERS FOR JOIN                     */
+    /* ------------------------------------------------------------------ */
+
+    /** Return true if the node is an anchor (its own anchor-label). */
+    bool isAnchor(tableint id) const noexcept {
+        return anchor_labels_[id] == id;
+    }
+
+    /** List of all anchors in *this* index. */
+    std::vector<tableint> getAnchors() const {
+        std::vector<tableint> out;
+        out.reserve(cur_element_count);
+        for (tableint i = 0; i < cur_element_count; ++i)
+            if (isAnchor(i)) out.push_back(i);
+        return out;
+    }
+
+    std::unordered_set<tableint> get_anchor_list() const {
+        return anchor_list_;
+    }
+
+    /** Constant reference to the cluster of an anchor. */
+    const std::vector<tableint>& getCluster(tableint anchor) const {
+        return anchor_connected_nodes_[anchor];
+    }
+
+    /** Geometric radius of an anchor’s cluster (k / LD). */
+    double anchorRadius(tableint anchor, size_t k) const {
+        double ld = local_density_[anchor];
+        if (ld <= 0) return std::numeric_limits<double>::infinity();
+        return static_cast<double>(k) / ld;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*                    ENTRY-POINT OVERRIDE SEARCH                     */
+    /* ------------------------------------------------------------------ */
+
+    /** Same behaviour as searchKnn(), but the walk starts at |entry_id|. */
+    std::priority_queue<std::pair<dist_t, tableint>,
+                        std::vector<std::pair<dist_t, tableint>>,
+                        CompareByFirst>
+    searchKnnEP(const void* query_data,
+                size_t k,
+                tableint entry_id,
+                size_t ef_override = 0) const
+    {
+        size_t old_ef = ef_;
+        if (ef_override) const_cast<HierarchicalNSW*>(this)->ef_ = ef_override;
+
+        std::priority_queue<std::pair<dist_t, tableint>,
+                            std::vector<std::pair<dist_t, tableint>>,
+                            CompareByFirst> result;
+
+        if (cur_element_count == 0) { if (ef_override) const_cast<HierarchicalNSW*>(this)->ef_ = old_ef; return result; }
+
+        tableint currObj = entry_id;
+        dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(currObj), dist_func_param_);
+
+        // for (int level = maxlevel_; level > 0; --level) {
+        //     bool changed = true;
+        //     while (changed) {
+        //         changed = false;
+        //         linklistsizeint * data;
+        //         data = (linklistsizeint *)get_linklist(currObj, level);
+        //         int sz   = getListCount(data);
+        //         tableint* datal = (tableint*)(data + 1);
+        //         for (int i = 0; i < sz; ++i) {
+        //             tableint cand = datal[i];
+        //             dist_t d      = fstdistfunc_(query_data, getDataByInternalId(cand), dist_func_param_);
+        //             if (d < curdist) { curdist = d; currObj = cand; changed = true; }
+        //         }
+        //     }
+        // }
+
+        bool bare = !num_deleted_;
+        auto pq = bare ? searchBaseLayerST<true>(currObj, query_data,
+                                                 std::max(ef_, k))
+                       : searchBaseLayerST<false>(currObj, query_data,
+                                                  std::max(ef_, k));
+
+        // while (pq.size() > k) pq.pop();
+        while (!pq.empty()) {
+            result.emplace(pq.top().first, pq.top().second); pq.pop();
+        }
+
+        if (ef_override) const_cast<HierarchicalNSW*>(this)->ef_ = old_ef;
+        return result;
+    }
+
+    /* ------------------------------------------------------------------ */
+    /*                         APPROXIMATE k-NN JOIN                      */
+    /* ------------------------------------------------------------------ */
+
+    /**
+     * Perform an approximate k-NN join:  for every point in *this* index (HA)
+     * return its k nearest neighbours drawn from index HB.
+     *
+     * @param HB         the right-hand HNSW index
+     * @param k          how many neighbours per point
+     * @param ef_join    ef parameter used during each HB search (0 ⇒ 3·k)
+     * @param anchor_L   how many nearest HB-anchors to probe per HA-anchor
+     *
+     * @return  result[a] = vector of k external labels from HB
+     */
+    std::vector<std::vector<labeltype>>
+    knnJoin(HierarchicalNSW<dist_t>& HB,
+            size_t k,
+            size_t ef_join  = 0,
+            size_t anchor_L = 32) const
+    {
+        if (ef_join == 0) ef_join = 3 * k;
+
+        /* -------- pre-compute anchor lists & radii ------------------- */
+        auto anchorsA = this->getAnchors();
+        auto anchorsB = HB.getAnchors();
+
+        std::vector<double> radA(this->cur_element_count, 0.0),
+                            radB(HB.cur_element_count,      0.0);
+        for (auto p : anchorsA) radA[p] = this->anchorRadius(p, k);
+        for (auto q : anchorsB) radB[q] = HB.  anchorRadius(q, k);
+
+        /* -------- initialise output structure ------------------------ */
+        std::vector<std::vector<labeltype>>
+            result(this->cur_element_count);   // by internal ID in *this*
+
+        /* -------- process each anchor p ------------------------------ */
+        for (tableint p : anchorsA) {
+
+            /* 2A – gather at most anchor_L nearest HB anchors */
+            auto pqB = HB.searchKnn(this->getDataByInternalId(p),
+                                    anchor_L);   // ordinary search
+            std::vector<tableint> candidateB;
+            while (!pqB.empty()) {
+                tableint q = pqB.top().second; pqB.pop();
+                if (!HB.isAnchor(q)) continue;  // keep true anchors only
+
+                dist_t d_c = this->fstdistfunc_(this->getDataByInternalId(p),
+                                                HB.getDataByInternalId(q),
+                                                this->dist_func_param_);
+                if (d_c <= radA[p] + radB[q])
+                    candidateB.push_back(q);
+            }
+            if (candidateB.empty()) continue;   // p’s cluster cannot match HB
+
+            /* 3 – for every point a in cluster(p), search HB starting at q */
+            for (tableint a : this->getCluster(p)) {
+                const void* vecA = this->getDataByInternalId(a);
+
+
+                /* collect best distance for every distinct ID */
+                std::unordered_map<tableint, dist_t> best;                
+                for (tableint q : candidateB) {
+                    auto knnB = HB.searchKnnEP(vecA, k+3, q, ef_join);
+
+                    while (!knnB.empty()) {
+
+                        tableint id   = knnB.top().second;
+                        dist_t   dist = knnB.top().first;
+                        auto it = best.find(id);
+                        if (it == best.end() || dist < it->second)
+                            best[id] = dist;                        
+                        knnB.pop();
+                    }
+                }
+                /* build min-heap from the unique set, keep k closest */
+                std::priority_queue<std::pair<dist_t, tableint>,
+                                    std::vector<std::pair<dist_t, tableint>>,
+                                    CompareByFirst> topk;
+                for (const auto& kv : best) {
+                    topk.emplace(kv.second, kv.first);
+                    if (topk.size() > k) topk.pop();
+                }
+
+                /* store external labels in ascending-distance order */
+                std::vector<labeltype>& out = result[a];
+                // std::cout<<a<<" ";
+                out.resize(topk.size());
+                for (size_t idx = topk.size(); idx > 0; --idx) {
+                    out[idx-1] = HB.getExternalLabel(topk.top().second);
+                    topk.pop();
+                }
+            } // end for each a∈cluster(p)
+        }     // end for each anchor p
+        return result;
+    }
+    /****************  Bridge & Burst helpers  ****************/
+
+    /** quick ED-radius:  R = (k′/LD)·d_k   with LD = k / d_k  */
+    float getEdRadius(tableint anchor, size_t kprime) const {
+        if (local_density_[anchor] == 0.0) return std::numeric_limits<float>::max();
+        float dk = static_cast<float>(density_k_) / static_cast<float>(local_density_[anchor]);
+        return dk * static_cast<float>(kprime) / static_cast<float>(density_k_);
+    }
+
+    /** raw vector distance between two data pointers (same metric) */
+    dist_t rawDist(const void* a, const void* b) const {
+        return fstdistfunc_(a, b, dist_func_param_);
+    }
+
+    /** distance between internal ids that may live in different indices */
+    dist_t distById(tableint ida, const HierarchicalNSW& other, tableint idb) const {
+        return fstdistfunc_(getDataByInternalId(ida),
+                            other.getDataByInternalId(idb),
+                            dist_func_param_);
+    }
+
+    /**
+     * Restricted k-NN: only nodes whose **internal id** is in
+     * `allowed_ids` are eligible (uses the label-filter hook internally).
+     */
+    template<typename IdSet>
+    std::priority_queue<std::pair<dist_t, labeltype>>
+    searchKnnRestricted(const void* query_data,
+                        size_t k,
+                        const IdSet& allowed_ids,
+                        size_t ef_override = 0) const
+    {
+        struct Allowed : public BaseFilterFunctor {
+            const HierarchicalNSW* idx;
+            const IdSet*           allowed;
+            Allowed(const HierarchicalNSW* i, const IdSet* s)
+                : idx(i), allowed(s) {}
+            bool operator()(labeltype lab) const  {
+                auto it = idx->label_lookup_.find(lab);
+                if (it == idx->label_lookup_.end()) return false;
+                return allowed->count(it->second) != 0;
+            }
+        } functor(this,&allowed_ids);
+
+        size_t old = ef_;
+        if (ef_override) const_cast<HierarchicalNSW*>(this)->setEf(ef_override);
+        auto pq = searchKnn(query_data, k, &functor);
+      
+        if (ef_override) const_cast<HierarchicalNSW*>(this)->setEf(old);
+        return pq;
+    }    
 private:
     // pr(p, h) distribution for h = 1..H
     std::vector<double> pr_dist_;
 
     // density-based pruning parameters
     // size_t density_k_ = 20;
-    double density_ratio_threshold_ = 0.5;  // keep candidates whose region density >= 0.5 * query_density
+    double density_ratio_threshold_ = 0.6;  // keep candidates whose region density >= 0.5 * query_density
 
     /** Algorithm 1: choose hop count k' */
     size_t getHopCountForQuery(size_t k, float recall) const {
@@ -1575,15 +2170,22 @@ private:
 
     /** PS2: prune if d(q,o) > l-th neighbor distance of o */
     bool prunePS2(const void* query_data, tableint node_id,
-                  size_t kprime, size_t /*k*/) const {
+                  size_t kprime, size_t k) const {
         double d_o_q = fstdistfunc_(query_data, getDataByInternalId(node_id), dist_func_param_);
-        auto neigh = getConnectionsWithLock(node_id, 0);
+        // auto neigh = getConnectionsWithLock(node_id, 0);
+        auto neigh = this->searchKnn(query_data,k);
         if (neigh.empty()) return false;
         std::vector<double> ds;
         ds.reserve(neigh.size());
-        for (auto nid : neigh)
+        auto neigh_temp = neigh;
+        while (!neigh_temp.empty())
+        {
+            tableint nid = neigh_temp.top().second;
             ds.push_back(fstdistfunc_(getDataByInternalId(nid), getDataByInternalId(node_id), dist_func_param_));
-        size_t l = std::min(kprime, neigh.size());
+            neigh_temp.pop();
+        }
+        
+        size_t l = std::min(k, neigh.size());
         std::nth_element(ds.begin(), ds.begin() + l - 1, ds.end());
         return d_o_q <= ds[l - 1];
     }
@@ -1593,7 +2195,72 @@ private:
         int a = anchor_labels_[node_id];
         if (a < 0) return true;  // no anchor info, do not prune
         double dens = local_density_[a];
-        return dens >= query_density * density_ratio_threshold_;
-    }    
+        return dens <= 2*query_density ;
+    }
+    bool pruneRadius(double query_density, tableint node_id, const void * query_data) const {
+        int a = anchor_labels_[node_id];
+        if (a < 0) return true;  // no anchor info, do not prune
+        double r1 = 40/ local_density_[a] ;
+        // double r2 = query_density * density_k_;
+        dist_t dist = fstdistfunc_(query_data, getDataByInternalId(node_id), dist_func_param_);
+        // std::cout<<"dist = "<<r1;
+        return dist < r1;
+    }        
+
+
+    // If u is now linked at level 0 to v, we call
+    //   tryReanchor(u, v);
+    // which tests whether v's anchor is *closer* to u
+    // than u's current anchor is, and if so migrates u.
+    void tryReanchor(tableint u, tableint v) {
+        // std::cout<<"How are ";
+
+        // 1) bounds safety
+        assert(u < cur_element_count);
+        assert(v < cur_element_count);
+
+        // 2) our anchor vectors must be sized for all elements
+        assert(anchor_children_by_dist_.size() == max_elements_);
+        assert(anchor_child_it_.size()            == max_elements_);
+        assert(node_anchor_dist_.size()          == max_elements_); 
+
+        
+        tableint oldA = anchor_labels_[u];
+        tableint newA = anchor_labels_[v];
+        // 3) old anchor must be valid, and iterator must live in that set
+        assert(oldA < anchor_children_by_dist_.size());
+        auto &oldSet = anchor_children_by_dist_[oldA];
+  
+        if (newA == oldA) return;
+        
+        // compute dist(u, newA)
+        char *pu = getDataByInternalId(u);
+        char *pa = getDataByInternalId(newA);
+        dist_t dnew = fstdistfunc_(pu, pa, dist_func_param_);
+
+        // compare to u’s current anchor‐distance
+        if (dnew < node_anchor_dist_[u]) {
+            // 1) remove u from old anchor set
+            anchor_children_by_dist_[oldA].erase(anchor_child_it_[u]);
+        {
+            auto &oldVec = anchor_connected_nodes_[oldA];
+            oldVec.erase(std::remove(oldVec.begin(), oldVec.end(), u),
+                         oldVec.end());
+        }            
+
+            // 2) insert into new anchor set
+            auto &S = anchor_children_by_dist_[newA];
+            // auto [it,ok] = S.emplace(dnew, u);
+            auto insert_res = S.emplace(dnew, u);
+            auto it         = insert_res.first;
+            bool ok         = insert_res.second;             
+            anchor_child_it_[u] = it;
+
+            // 3) update state
+            anchor_labels_[u]    = newA;
+            node_anchor_dist_[u] = dnew;
+        }
+    }
+
 };
 }  // namespace hnswlib

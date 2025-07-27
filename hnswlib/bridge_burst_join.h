@@ -17,21 +17,17 @@
 namespace hnswlib {
 
 template<typename dist_t>
-class BridgeBurstJoin  :public HierarchicalNSW<dist_t>{
+class BridgeBurstJoin {
     using HNSW = HierarchicalNSW<dist_t>;
     using Pair = std::pair<dist_t, labeltype>;
-    struct Compare {
-        bool operator()(Pair const& a, Pair const& b) const {
-            return a.first > b.first;  // “a has lower priority if its dist is larger”
-        }
-    };    
 
+    
 public:
     /** --------  phase-0 : create K_bridge outgoing links for every anchor in A  */
     static void buildBridges(HNSW& A,
                              HNSW& B,
-                             size_t k_bridge = 20,
-                             float  lambda   = 15,
+                             size_t k_bridge = 4,
+                             float  lambda   = 5,
                              size_t kprime   = 20)
     {
         /* gather anchor ids in each index */
@@ -55,7 +51,7 @@ public:
         auto t1 =std::chrono::high_resolution_clock::now();
         auto t_approx = std::chrono::duration<double, std::milli>(t1 - t0).count();
 
-        std::cout<<"Initial takes "<<t_approx<<std::endl;          
+        std::cout<<"Getting anchors takes "<<t_approx<<std::endl;          
 
 
         /* brute k-NN over anchorsB (small) – keep best k_bridge */
@@ -99,8 +95,8 @@ public:
     joinAtoB(const HNSW& A,
              const HNSW& B,
              size_t k          = 10,
-             size_t ef_base    = 20,
-             float  tau        = 1.1,
+             size_t ef_base    = 5,
+            //  float  tau        = 1.1,
              size_t kprime     = 20)
     {
         using DistPair = std::pair<dist_t /*dist*/, tableint /*id*/>;
@@ -124,75 +120,49 @@ public:
             float LD_src = A.local_density_[ancA];
             if (LD_src==0.0) LD_src = 1e-6f;
 
+            /* collect best candidates from all pivot anchors */
+            std::priority_queue<Pair,
+                                std::vector<Pair>,
+                                std::greater<Pair>> topk;   // min-heap (greater)
+
+
             std::unordered_set<tableint> candidate_ids;
-            std::priority_queue<Pair, std::vector<Pair>, Compare> candidates_q;
+            std::priority_queue<DistPair> candidates_q;
 
 
             /* --------  burst for every bridge  -------- */
             for (tableint ancB : A.bridge_out_[ancA]) {
                 /* bucket & 1-hop halo */
-                for (tableint nid : B.anchor_connected_nodes_[ancB]){
-                    candidate_ids.insert(nid);
-                    dist_t curdist = A.rawDist(A.getDataByInternalId(idA), B.getDataByInternalId(nid) );
-                    candidates_q.emplace(curdist ,B.getExternalLabel(nid));
-                    // // std::cout<<curdist<<" ";
-                    // if (candidates_q.size() > k)
-                    // {
-                    //     candidates_q.pop();
-                    // }
-                    
-                }
+                // for (tableint nid : B.anchor_connected_nodes_[ancB])
+                //     candidate_ids.insert(nid);
+                    // dist_t curdist =
+                    //         hnswlin::fstdistfunc_(A.getDataByInternalId(idA),
+                    //                         B.getDataByInternalId(nid),
+                    //                         dist_func_param_);
+                    // candidates_q.emplace(nid,curdist );
 
-                auto halo = B.getConnectionsWithLock(ancB,0);  // 1-hop
-                for (auto nid : halo) {
-                    candidate_ids.insert(nid);
-                    dist_t curdist =  A.rawDist(A.getDataByInternalId(idA), B.getDataByInternalId(nid));
-                    candidates_q.emplace(curdist, B.getExternalLabel(nid) );
-                    // if (candidates_q.size() > k)
-                    // {
-                    //     candidates_q.pop();
-                    // }                    
-                }
+                // auto halo = B.getConnectionsWithLock(ancB,0);  // 1-hop
+                // for (auto nid : halo) candidate_ids.insert(nid);
 
-                // /* adaptive search budget */
-                // float LD_dst = B.local_density_[ancB];
-                // size_t ef    = ef_base * (LD_dst/LD_src);
-                // ef           = std::max<size_t>(ef_base, ef);
+                /* adaptive search budget */
+                float LD_dst = B.local_density_[ancB];
+                size_t ef    = ef_base * (LD_dst/LD_src);
+                ef           = std::max<size_t>(ef_base, ef);
 
-                // /* restricted k-NN */
+                /* restricted k-NN */
                 // auto pq = B.searchKnnRestricted(qvec, k, candidate_ids, ef);
-
+                auto top_candidates = B.searchBaseLayerST(
+                            ancB, qvec, std::max(ef, k));  
                 /* copy into output map */
-                // auto labA = A.getExternalLabel(idA);
-                // auto& vec = result[labA];
-                // while (!pq.empty()) {
-                //     vec.push_back(pq.top());
-                //     pq.pop();
-                // }
-                // int cnt  = 0;
-                // while ( ! candidates_q.empty() and cnt<k)
-                // {
-                //     // auto result_ele = std::make_pair(candidates_q.top().second(), )
-                //     vec.push_back(candidates_q.top());
-                //     candidates_q.pop();    
-                //     cnt++;                
-                // }
-                
-                // candidate_ids.clear();
-                // candidates_q.clear();
+                auto labA = A.getExternalLabel(idA);
+                auto& vec = result[labA];
+                while (!top_candidates.empty()) {
+                    vec.emplace_back(top_candidates.top().first, B.getExternalLabel(top_candidates.top().second) );
+                    top_candidates.pop();
+                }
+                candidate_ids.clear();
+                // break;
             }
-
-            auto labA = A.getExternalLabel(idA);
-            auto& vec = result[labA];
-
-            int cnt  = 0;
-            while ( ! candidates_q.empty() and cnt<k)
-            {
-                // auto result_ele = std::make_pair(candidates_q.top().second(), )
-                vec.push_back(candidates_q.top());
-                candidates_q.pop();    
-                cnt++;                
-            }        
         }
         return result;
     }
